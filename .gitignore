@@ -1,0 +1,15 @@
+/target/
+**/target/
+
+# Runtime / local state
+/data/
+/test_db_aggregates/
+*.log
+probe_out.txt
+check.log
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
