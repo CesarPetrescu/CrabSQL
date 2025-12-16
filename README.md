@@ -20,7 +20,7 @@ If you (human or AI agent) are making changes:
   - `DROP TABLE [IF EXISTS]`
 - Basic DML:
   - `INSERT INTO ... VALUES ...`
-  - `SELECT ... FROM ...` with multi-table `FROM` (comma joins) and `INNER JOIN ... ON ...` (subset; supports table aliases)
+  - `SELECT ... FROM ...` with multi-table `FROM` (comma joins) and `INNER`/`LEFT`/`RIGHT JOIN` with `ON`, `USING(...)`, and `NATURAL` constraints (subset; supports table aliases)
   - `SELECT ... [WHERE ...] [ORDER BY ...] [LIMIT/OFFSET]`
   - `SELECT DISTINCT ...`
   - Aggregates: `COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`, `HAVING` (subset)
@@ -37,7 +37,7 @@ If you (human or AI agent) are making changes:
 ## What it intentionally does NOT support
 
 - Full SQL grammar / optimizer
-- Outer joins (LEFT/RIGHT/FULL), join reordering/optimization, and most planner features
+- FULL OUTER joins, join reordering/optimization, and most planner features
 - Subqueries, window functions, CTEs, views, triggers, stored routines
 - Full MySQL type/collation system (current types are a small subset)
 - Secondary indexes

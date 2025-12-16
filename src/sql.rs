@@ -2297,50 +2297,162 @@ fn handle_query(
         // 2. Process chained Joins
         for join in &table_with_joins.joins {
             let (j_def, j_rows) = scan_table(&join.relation)?;
+            let right_col_count = j_def.columns.len();
             loaded_defs.push(j_def);
             let j_def_idx = loaded_defs.len() - 1;
 
-            // Nested Loop again
-            let mut new_rows = Vec::with_capacity(accumulated_rows.len() * j_rows.len());
-            for left in &accumulated_rows {
-                for right in &j_rows {
-                    let mut combined = left.values.clone();
-                    combined.extend(right.values.clone());
-                    new_rows.push(Row { values: combined });
-                }
+            #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+            enum JoinKind {
+                Inner,
+                Left,
+                Right,
             }
-            accumulated_rows = new_rows;
-            accumulated_def_indices.push(j_def_idx);
 
-            // TODO: Handle ON clause here to filter early?
-            // For now we will rely on WHERE or generic filtering if possible,
-            // but correct JOIN semantic requires filtering *before* output if it's OUTER JOIN.
-            // For INNER JOIN, post-filtering is semantically equivalent but slower.
+            let (join_kind, constraint) = match &join.join_operator {
+                ast::JoinOperator::Join(c)
+                | ast::JoinOperator::Inner(c)
+                | ast::JoinOperator::CrossJoin(c)
+                | ast::JoinOperator::StraightJoin(c) => (JoinKind::Inner, c),
+                ast::JoinOperator::Left(c) | ast::JoinOperator::LeftOuter(c) => (JoinKind::Left, c),
+                ast::JoinOperator::Right(c) | ast::JoinOperator::RightOuter(c) => {
+                    (JoinKind::Right, c)
+                }
+                ast::JoinOperator::FullOuter(_) => {
+                    return Err(MiniError::NotSupported(
+                        "FULL OUTER joins are not supported".into(),
+                    ))
+                }
+                other => {
+                    return Err(MiniError::NotSupported(format!(
+                        "JOIN operator not supported: {other:?}"
+                    )))
+                }
+            };
 
-            let constraint = match &join.join_operator {
-                ast::JoinOperator::Inner(c) => Some(c),
-                ast::JoinOperator::Join(c) => Some(c),
+            let right_def = &loaded_defs[j_def_idx];
+            let left_defs: Vec<&TableDef> = accumulated_def_indices
+                .iter()
+                .map(|&idx| &loaded_defs[idx])
+                .collect();
+            let left_col_count: usize = left_defs.iter().map(|d| d.columns.len()).sum();
+
+            let derived_on_expr: Option<ast::Expr> = match constraint {
+                ast::JoinConstraint::Using(cols) => {
+                    Some(build_using_join_on_expr(&left_defs, right_def, cols)?)
+                }
+                ast::JoinConstraint::Natural => build_natural_join_on_expr(&left_defs, right_def)?,
                 _ => None,
             };
 
-            if let Some(constraint) = constraint {
-                if let ast::JoinConstraint::On(expr) = constraint {
-                    // Filter immediately using temp_defs slice
-                    let temp_defs: Vec<&TableDef> = accumulated_def_indices
-                        .iter()
-                        .map(|&idx| &loaded_defs[idx])
-                        .collect();
-                    let col_map = build_col_map(&temp_defs);
+            let on_expr: Option<&ast::Expr> = match constraint {
+                ast::JoinConstraint::On(expr) => Some(expr),
+                ast::JoinConstraint::None => None,
+                ast::JoinConstraint::Using(_) | ast::JoinConstraint::Natural => {
+                    derived_on_expr.as_ref()
+                }
+            };
 
-                    let mut filtered = Vec::new();
-                    for row in accumulated_rows {
-                        if eval_condition(session, expr, &row, &col_map)? {
-                            filtered.push(row);
+            // JOIN output shape always appends the right table's columns.
+            accumulated_def_indices.push(j_def_idx);
+            let temp_defs: Vec<&TableDef> = accumulated_def_indices
+                .iter()
+                .map(|&idx| &loaded_defs[idx])
+                .collect();
+            let temp_col_map = build_col_map(&temp_defs);
+
+            let left_rows = std::mem::take(&mut accumulated_rows);
+            let equi_join_pairs = on_expr
+                .and_then(|expr| extract_equi_join_pairs(expr, &temp_col_map, left_col_count));
+
+            let mut new_rows = Vec::with_capacity(
+                left_rows
+                    .len()
+                    .saturating_mul(std::cmp::max(1, j_rows.len())),
+            );
+
+            let right_nulls = vec![Cell::Null; right_col_count];
+            let left_nulls = vec![Cell::Null; left_col_count];
+
+            match join_kind {
+                JoinKind::Inner | JoinKind::Left => {
+                    for left in &left_rows {
+                        let mut matched = false;
+                        for right in &j_rows {
+                            if let Some(pairs) = &equi_join_pairs {
+                                if eval_equi_join_pairs(left, right, pairs) {
+                                    matched = true;
+                                    let mut combined = left.values.clone();
+                                    combined.extend(right.values.clone());
+                                    new_rows.push(Row { values: combined });
+                                }
+                            } else {
+                                let mut combined = left.values.clone();
+                                combined.extend(right.values.clone());
+                                let row = Row { values: combined };
+                                let ok = match on_expr {
+                                    Some(expr) => {
+                                        eval_condition(session, expr, &row, &temp_col_map)?
+                                    }
+                                    None => true,
+                                };
+                                if ok {
+                                    matched = true;
+                                    new_rows.push(row);
+                                }
+                            }
+                        }
+
+                        if join_kind == JoinKind::Left && !matched {
+                            let mut combined = left.values.clone();
+                            combined.extend(right_nulls.clone());
+                            new_rows.push(Row { values: combined });
                         }
                     }
-                    accumulated_rows = filtered;
+                }
+                JoinKind::Right => {
+                    let mut new_rows = Vec::with_capacity(
+                        j_rows
+                            .len()
+                            .saturating_mul(std::cmp::max(1, left_rows.len())),
+                    );
+                    for right in &j_rows {
+                        let mut matched = false;
+                        for left in &left_rows {
+                            if let Some(pairs) = &equi_join_pairs {
+                                if eval_equi_join_pairs(left, right, pairs) {
+                                    matched = true;
+                                    let mut combined = left.values.clone();
+                                    combined.extend(right.values.clone());
+                                    new_rows.push(Row { values: combined });
+                                }
+                            } else {
+                                let mut combined = left.values.clone();
+                                combined.extend(right.values.clone());
+                                let row = Row { values: combined };
+                                let ok = match on_expr {
+                                    Some(expr) => {
+                                        eval_condition(session, expr, &row, &temp_col_map)?
+                                    }
+                                    None => true,
+                                };
+                                if ok {
+                                    matched = true;
+                                    new_rows.push(row);
+                                }
+                            }
+                        }
+
+                        if !matched {
+                            let mut combined = left_nulls.clone();
+                            combined.extend(right.values.clone());
+                            new_rows.push(Row { values: combined });
+                        }
+                    }
+                    accumulated_rows = new_rows;
+                    continue;
                 }
             }
+            accumulated_rows = new_rows;
         }
     }
 
@@ -3146,8 +3258,8 @@ fn execute_select_from_rows(
     // 2. Projections & Aggregation Analysis
     #[derive(Clone, Debug)]
     enum ProjKind {
-        Scalar(ast::Expr), // Standard expression
-        Aggregate(usize),  // Index into accumulators
+        Scalar(Box<ast::Expr>), // Standard expression
+        Aggregate(usize),       // Index into accumulators
     }
 
     let mut projection_plan: Vec<(String, ProjKind)> = Vec::new(); // (Alias, Kind)
@@ -3193,7 +3305,9 @@ fn execute_select_from_rows(
                     for c in &defs[0].columns {
                         projection_plan.push((
                             c.name.clone(),
-                            ProjKind::Scalar(ast::Expr::Identifier(ast::Ident::new(&c.name))),
+                            ProjKind::Scalar(Box::new(ast::Expr::Identifier(ast::Ident::new(
+                                &c.name,
+                            )))),
                         ));
                     }
                 } else {
@@ -3203,10 +3317,10 @@ fn execute_select_from_rows(
                         for c in &def.columns {
                             projection_plan.push((
                                 c.name.clone(),
-                                ProjKind::Scalar(ast::Expr::CompoundIdentifier(vec![
+                                ProjKind::Scalar(Box::new(ast::Expr::CompoundIdentifier(vec![
                                     ast::Ident::new(&def.name),
                                     ast::Ident::new(&c.name),
-                                ])),
+                                ]))),
                             ));
                         }
                     }
@@ -3235,10 +3349,10 @@ fn execute_select_from_rows(
                 for c in &def.columns {
                     projection_plan.push((
                         c.name.clone(),
-                        ProjKind::Scalar(ast::Expr::CompoundIdentifier(vec![
+                        ProjKind::Scalar(Box::new(ast::Expr::CompoundIdentifier(vec![
                             ast::Ident::new(&def.name),
                             ast::Ident::new(&c.name),
-                        ])),
+                        ]))),
                     ));
                 }
             }
@@ -3252,7 +3366,7 @@ fn execute_select_from_rows(
                     aggs_to_compute.push((fname, arg));
                     projection_plan.push((alias, ProjKind::Aggregate(idx)));
                 } else {
-                    projection_plan.push((alias, ProjKind::Scalar(expr.clone())));
+                    projection_plan.push((alias, ProjKind::Scalar(Box::new(expr.clone()))));
                 }
             }
             ast::SelectItem::ExprWithAlias { expr, alias } => {
@@ -3261,7 +3375,10 @@ fn execute_select_from_rows(
                     aggs_to_compute.push((fname, arg));
                     projection_plan.push((alias.value.clone(), ProjKind::Aggregate(idx)));
                 } else {
-                    projection_plan.push((alias.value.clone(), ProjKind::Scalar(expr.clone())));
+                    projection_plan.push((
+                        alias.value.clone(),
+                        ProjKind::Scalar(Box::new(expr.clone())),
+                    ));
                 }
             }
         }
@@ -3287,7 +3404,7 @@ fn execute_select_from_rows(
             let mut out_row = Vec::new();
             for (_, kind) in &projection_plan {
                 if let ProjKind::Scalar(e) = kind {
-                    out_row.push(eval_row_expr(session, e, &row, &col_map)?);
+                    out_row.push(eval_row_expr(session, e.as_ref(), &row, &col_map)?);
                 } else {
                     return Err(MiniError::Invalid(
                         "Unexpected aggregate in non-grouped query".into(),
@@ -3397,10 +3514,8 @@ fn execute_select_from_rows(
                     if cmp == std::cmp::Ordering::Less {
                         self.val = v;
                     }
-                } else {
-                    if cmp == std::cmp::Ordering::Greater {
-                        self.val = v;
-                    }
+                } else if cmp == std::cmp::Ordering::Greater {
+                    self.val = v;
                 }
             }
         }
@@ -3489,7 +3604,12 @@ fn execute_select_from_rows(
             match kind {
                 ProjKind::Scalar(expr) => {
                     // Evaluate against representative row
-                    out_row.push(eval_row_expr(session, expr, &state.first_row, &col_map)?);
+                    out_row.push(eval_row_expr(
+                        session,
+                        expr.as_ref(),
+                        &state.first_row,
+                        &col_map,
+                    )?);
                 }
                 ProjKind::Aggregate(idx) => {
                     out_row.push(state.accumulators[*idx].finish());
@@ -3599,14 +3719,9 @@ fn finish_select(
             rows.sort_by(|a, b| {
                 for (idx, desc) in &sort_keys {
                     let cmp = compare_cell_for_order(&a[*idx], &b[*idx]);
-                    if *desc {
-                        if cmp.reverse() != std::cmp::Ordering::Equal {
-                            return cmp.reverse();
-                        }
-                    } else {
-                        if cmp != std::cmp::Ordering::Equal {
-                            return cmp;
-                        }
+                    let cmp = if *desc { cmp.reverse() } else { cmp };
+                    if cmp != std::cmp::Ordering::Equal {
+                        return cmp;
                     }
                 }
                 std::cmp::Ordering::Equal
@@ -3854,63 +3969,250 @@ fn eval_condition(
     row: &Row,
     col_map: &std::collections::HashMap<String, usize>,
 ) -> Result<bool, MiniError> {
-    match expr {
-        ast::Expr::Nested(inner) => eval_condition(session, inner, row, col_map),
-        ast::Expr::BinaryOp { left, op, right } => {
-            match op {
-                ast::BinaryOperator::And => {
-                    return Ok(eval_condition(session, left, row, col_map)?
-                        && eval_condition(session, right, row, col_map)?);
-                }
-                ast::BinaryOperator::Or => {
-                    return Ok(eval_condition(session, left, row, col_map)?
-                        || eval_condition(session, right, row, col_map)?);
-                }
-                _ => {}
-            }
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum TriBool {
+        True,
+        False,
+        Unknown,
+    }
 
-            let l_val = eval_row_expr(session, left, row, col_map)?;
-            let r_val = eval_row_expr(session, right, row, col_map)?;
-
-            // Type coercion for comparison
-            let (l_final, r_final) = match (&l_val, &r_val) {
-                (Cell::Float(_), Cell::Text(s)) | (Cell::Text(s), Cell::Float(_)) => {
-                    // Try to coerce text to float
-                    if let Ok(f) = s.parse::<f64>() {
-                        if matches!(l_val, Cell::Float(_)) {
-                            (l_val.clone(), Cell::Float(f))
-                        } else {
-                            (Cell::Float(f), r_val.clone())
-                        }
-                    } else {
-                        (l_val.clone(), r_val.clone()) // Fallback
-                    }
-                }
-                // Simple Date coercion if needed?
-                // Assuming strict format for now or string compare.
-                // String compare is fine for ISO dates.
-                _ => (l_val.clone(), r_val.clone()),
-            };
-
-            let cmp = compare_cell_for_order(&l_final, &r_final);
-            match op {
-                ast::BinaryOperator::Eq => Ok(cmp == std::cmp::Ordering::Equal),
-                ast::BinaryOperator::NotEq => Ok(cmp != std::cmp::Ordering::Equal),
-                ast::BinaryOperator::Gt => Ok(cmp == std::cmp::Ordering::Greater),
-                ast::BinaryOperator::Lt => Ok(cmp == std::cmp::Ordering::Less),
-                ast::BinaryOperator::GtEq => Ok(cmp != std::cmp::Ordering::Less),
-                ast::BinaryOperator::LtEq => Ok(cmp != std::cmp::Ordering::Greater),
-                _ => Err(MiniError::NotSupported(format!(
-                    "Operator not supported: {}",
-                    op
-                ))),
+    impl TriBool {
+        fn and(self, other: TriBool) -> TriBool {
+            match (self, other) {
+                (TriBool::False, _) | (_, TriBool::False) => TriBool::False,
+                (TriBool::True, b) => b,
+                (TriBool::Unknown, TriBool::True) => TriBool::Unknown,
+                (TriBool::Unknown, TriBool::Unknown) => TriBool::Unknown,
             }
         }
-        _ => Err(MiniError::NotSupported(format!(
-            "Condition not supported: {}",
-            expr
-        ))),
+
+        fn or(self, other: TriBool) -> TriBool {
+            match (self, other) {
+                (TriBool::True, _) | (_, TriBool::True) => TriBool::True,
+                (TriBool::False, b) => b,
+                (TriBool::Unknown, TriBool::False) => TriBool::Unknown,
+                (TriBool::Unknown, TriBool::Unknown) => TriBool::Unknown,
+            }
+        }
+
+        fn not(self) -> TriBool {
+            match self {
+                TriBool::True => TriBool::False,
+                TriBool::False => TriBool::True,
+                TriBool::Unknown => TriBool::Unknown,
+            }
+        }
+
+        fn is_true(self) -> bool {
+            matches!(self, TriBool::True)
+        }
     }
+
+    fn eval_tri(
+        session: &SessionState,
+        expr: &ast::Expr,
+        row: &Row,
+        col_map: &std::collections::HashMap<String, usize>,
+    ) -> Result<TriBool, MiniError> {
+        match expr {
+            ast::Expr::Nested(inner) => eval_tri(session, inner, row, col_map),
+            ast::Expr::BinaryOp { left, op, right } => {
+                match op {
+                    ast::BinaryOperator::And => {
+                        return Ok(eval_tri(session, left, row, col_map)?
+                            .and(eval_tri(session, right, row, col_map)?));
+                    }
+                    ast::BinaryOperator::Or => {
+                        return Ok(eval_tri(session, left, row, col_map)?
+                            .or(eval_tri(session, right, row, col_map)?));
+                    }
+                    _ => {}
+                }
+
+                let l_val = eval_row_expr(session, left, row, col_map)?;
+                let r_val = eval_row_expr(session, right, row, col_map)?;
+                if matches!(l_val, Cell::Null) || matches!(r_val, Cell::Null) {
+                    return Ok(TriBool::Unknown);
+                }
+
+                // Type coercion for comparison
+                let (l_final, r_final) = match (&l_val, &r_val) {
+                    (Cell::Float(_), Cell::Text(s)) | (Cell::Text(s), Cell::Float(_)) => {
+                        // Try to coerce text to float
+                        if let Ok(f) = s.parse::<f64>() {
+                            if matches!(l_val, Cell::Float(_)) {
+                                (l_val.clone(), Cell::Float(f))
+                            } else {
+                                (Cell::Float(f), r_val.clone())
+                            }
+                        } else {
+                            (l_val.clone(), r_val.clone()) // Fallback
+                        }
+                    }
+                    // String compare is fine for ISO dates.
+                    _ => (l_val.clone(), r_val.clone()),
+                };
+
+                let cmp = compare_cell_for_order(&l_final, &r_final);
+                let ok = match op {
+                    ast::BinaryOperator::Eq => cmp == std::cmp::Ordering::Equal,
+                    ast::BinaryOperator::NotEq => cmp != std::cmp::Ordering::Equal,
+                    ast::BinaryOperator::Gt => cmp == std::cmp::Ordering::Greater,
+                    ast::BinaryOperator::Lt => cmp == std::cmp::Ordering::Less,
+                    ast::BinaryOperator::GtEq => cmp != std::cmp::Ordering::Less,
+                    ast::BinaryOperator::LtEq => cmp != std::cmp::Ordering::Greater,
+                    _ => {
+                        return Err(MiniError::NotSupported(format!(
+                            "Operator not supported: {}",
+                            op
+                        )))
+                    }
+                };
+
+                Ok(if ok { TriBool::True } else { TriBool::False })
+            }
+            ast::Expr::UnaryOp { op, expr } => match op {
+                ast::UnaryOperator::Not => Ok(eval_tri(session, expr, row, col_map)?.not()),
+                _ => Err(MiniError::NotSupported(format!(
+                    "Unary operator not supported in WHERE: {}",
+                    op
+                ))),
+            },
+            ast::Expr::IsNull(expr) => {
+                let v = eval_row_expr(session, expr, row, col_map)?;
+                Ok(if matches!(v, Cell::Null) {
+                    TriBool::True
+                } else {
+                    TriBool::False
+                })
+            }
+            ast::Expr::IsNotNull(expr) => {
+                let v = eval_row_expr(session, expr, row, col_map)?;
+                Ok(if matches!(v, Cell::Null) {
+                    TriBool::False
+                } else {
+                    TriBool::True
+                })
+            }
+            ast::Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                if list.is_empty() {
+                    return Err(MiniError::Invalid("IN (...) list cannot be empty".into()));
+                }
+
+                let needle = eval_row_expr(session, expr, row, col_map)?;
+                if matches!(needle, Cell::Null) {
+                    return Ok(TriBool::Unknown);
+                }
+
+                let mut has_null = false;
+                for item in list {
+                    let v = eval_row_expr(session, item, row, col_map)?;
+                    if matches!(v, Cell::Null) {
+                        has_null = true;
+                        continue;
+                    }
+                    if compare_cell_for_order(&needle, &v) == std::cmp::Ordering::Equal {
+                        return Ok(if *negated {
+                            TriBool::False
+                        } else {
+                            TriBool::True
+                        });
+                    }
+                }
+
+                let base = if has_null {
+                    TriBool::Unknown
+                } else {
+                    TriBool::False
+                };
+                Ok(if *negated { base.not() } else { base })
+            }
+            ast::Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => {
+                let v = eval_row_expr(session, expr, row, col_map)?;
+                let lo = eval_row_expr(session, low, row, col_map)?;
+                let hi = eval_row_expr(session, high, row, col_map)?;
+                if matches!(v, Cell::Null) || matches!(lo, Cell::Null) || matches!(hi, Cell::Null) {
+                    return Ok(TriBool::Unknown);
+                }
+
+                let ge_lo = compare_cell_for_order(&v, &lo) != std::cmp::Ordering::Less;
+                let le_hi = compare_cell_for_order(&v, &hi) != std::cmp::Ordering::Greater;
+                let base = if ge_lo && le_hi {
+                    TriBool::True
+                } else {
+                    TriBool::False
+                };
+                Ok(if *negated { base.not() } else { base })
+            }
+            ast::Expr::Like {
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
+            } => {
+                if *any {
+                    return Err(MiniError::NotSupported(
+                        "LIKE ANY(...) is not supported".into(),
+                    ));
+                }
+
+                let v = eval_row_expr(session, expr, row, col_map)?;
+                let pat = eval_row_expr(session, pattern, row, col_map)?;
+                if matches!(v, Cell::Null) || matches!(pat, Cell::Null) {
+                    return Ok(TriBool::Unknown);
+                }
+
+                let escape = like_escape_char(escape_char.as_ref())?;
+                let ok = sql_like_matches(&cell_to_string(&v), &cell_to_string(&pat), escape);
+                let base = if ok { TriBool::True } else { TriBool::False };
+                Ok(if *negated { base.not() } else { base })
+            }
+            ast::Expr::ILike {
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
+            } => {
+                if *any {
+                    return Err(MiniError::NotSupported(
+                        "ILIKE ANY(...) is not supported".into(),
+                    ));
+                }
+
+                let v = eval_row_expr(session, expr, row, col_map)?;
+                let pat = eval_row_expr(session, pattern, row, col_map)?;
+                if matches!(v, Cell::Null) || matches!(pat, Cell::Null) {
+                    return Ok(TriBool::Unknown);
+                }
+
+                let escape = like_escape_char(escape_char.as_ref())?;
+                let ok = sql_like_matches(
+                    &cell_to_string(&v).to_ascii_lowercase(),
+                    &cell_to_string(&pat).to_ascii_lowercase(),
+                    escape,
+                );
+                let base = if ok { TriBool::True } else { TriBool::False };
+                Ok(if *negated { base.not() } else { base })
+            }
+            _ => Err(MiniError::NotSupported(format!(
+                "Condition not supported: {}",
+                expr
+            ))),
+        }
+    }
+
+    Ok(eval_tri(session, expr, row, col_map)?.is_true())
 }
 
 fn coerce_cell(cell: Cell, target: &SqlType) -> Result<Cell, MiniError> {
@@ -3997,6 +4299,297 @@ fn object_name_to_parts(name: &ObjectName) -> Result<(Option<String>, String), M
             "object name with more than 2 parts is not supported".into(),
         )),
     }
+}
+
+fn like_escape_char(escape_char: Option<&ast::Value>) -> Result<char, MiniError> {
+    let Some(v) = escape_char else {
+        return Ok('\\');
+    };
+
+    let s = match v {
+        ast::Value::SingleQuotedString(s) => s.as_str(),
+        ast::Value::DoubleQuotedString(s) => s.as_str(),
+        _ => {
+            return Err(MiniError::NotSupported(
+                "ESCAPE value must be a quoted string".into(),
+            ))
+        }
+    };
+
+    let mut chars = s.chars();
+    let Some(ch) = chars.next() else {
+        return Err(MiniError::Invalid("ESCAPE string cannot be empty".into()));
+    };
+    if chars.next().is_some() {
+        return Err(MiniError::Invalid(
+            "ESCAPE string must be a single character".into(),
+        ));
+    }
+    Ok(ch)
+}
+
+fn sql_like_matches(text: &str, pattern: &str, escape: char) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+
+    let mut ti = 0usize;
+    let mut pi = 0usize;
+
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+
+    while ti < t.len() {
+        if pi < p.len() {
+            let pc = p[pi];
+            if pc == '%' {
+                star_pi = Some(pi);
+                pi += 1;
+                while pi < p.len() && p[pi] == '%' {
+                    pi += 1;
+                }
+                star_ti = ti;
+                continue;
+            }
+
+            if pc == escape {
+                if pi + 1 < p.len() {
+                    let lit = p[pi + 1];
+                    if lit == t[ti] {
+                        pi += 2;
+                        ti += 1;
+                        continue;
+                    }
+                } else if pc == t[ti] {
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+            } else if pc == '_' || pc == t[ti] {
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+        }
+
+        if let Some(star_pos) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = star_pos + 1;
+            continue;
+        }
+
+        return false;
+    }
+
+    while pi < p.len() {
+        if p[pi] == '%' {
+            pi += 1;
+            continue;
+        }
+        if p[pi] == escape && pi + 1 < p.len() {
+            return false;
+        }
+        break;
+    }
+
+    pi == p.len()
+}
+
+fn table_def_has_column(def: &TableDef, col: &str) -> bool {
+    def.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col))
+}
+
+fn find_unique_table_for_column<'a>(
+    defs: &'a [&'a TableDef],
+    col: &str,
+) -> Result<&'a TableDef, MiniError> {
+    let mut matches = defs
+        .iter()
+        .copied()
+        .filter(|d| table_def_has_column(d, col));
+    let Some(first) = matches.next() else {
+        return Err(MiniError::NotFound(format!(
+            "unknown column `{col}` in JOIN constraint"
+        )));
+    };
+    if matches.next().is_some() {
+        return Err(MiniError::Invalid(format!(
+            "ambiguous column `{col}` in JOIN constraint"
+        )));
+    }
+    Ok(first)
+}
+
+fn using_column_name(name: &ObjectName) -> Result<String, MiniError> {
+    if name.0.len() != 1 {
+        return Err(MiniError::NotSupported(
+            "qualified column names in USING(...) are not supported".into(),
+        ));
+    }
+    let col = get_ident_name(&name.0[0]);
+    if col.is_empty() {
+        return Err(MiniError::NotSupported(
+            "non-identifier column names in USING(...) are not supported".into(),
+        ));
+    }
+    Ok(col)
+}
+
+fn build_eq_column_expr(left_table: &str, right_table: &str, col: &str) -> ast::Expr {
+    ast::Expr::BinaryOp {
+        left: Box::new(ast::Expr::CompoundIdentifier(vec![
+            Ident::new(left_table),
+            Ident::new(col),
+        ])),
+        op: ast::BinaryOperator::Eq,
+        right: Box::new(ast::Expr::CompoundIdentifier(vec![
+            Ident::new(right_table),
+            Ident::new(col),
+        ])),
+    }
+}
+
+fn build_and_expr(left: ast::Expr, right: ast::Expr) -> ast::Expr {
+    ast::Expr::BinaryOp {
+        left: Box::new(left),
+        op: ast::BinaryOperator::And,
+        right: Box::new(right),
+    }
+}
+
+fn build_using_join_on_expr(
+    left_defs: &[&TableDef],
+    right_def: &TableDef,
+    cols: &[ObjectName],
+) -> Result<ast::Expr, MiniError> {
+    if cols.is_empty() {
+        return Err(MiniError::Invalid(
+            "USING(...) must specify at least one column".into(),
+        ));
+    }
+
+    let right_table = right_def.name.clone();
+    let mut expr_opt: Option<ast::Expr> = None;
+
+    for col_obj in cols {
+        let col = using_column_name(col_obj)?;
+
+        if !table_def_has_column(right_def, &col) {
+            return Err(MiniError::NotFound(format!(
+                "unknown column `{col}` in right table for USING(...)"
+            )));
+        }
+
+        let left_def = find_unique_table_for_column(left_defs, &col)?;
+        let eq = build_eq_column_expr(&left_def.name, &right_table, &col);
+        expr_opt = Some(match expr_opt {
+            None => eq,
+            Some(prev) => build_and_expr(prev, eq),
+        });
+    }
+
+    Ok(expr_opt.expect("cols is non-empty"))
+}
+
+fn build_natural_join_on_expr(
+    left_defs: &[&TableDef],
+    right_def: &TableDef,
+) -> Result<Option<ast::Expr>, MiniError> {
+    let right_table = right_def.name.clone();
+    let mut expr_opt: Option<ast::Expr> = None;
+
+    for col_def in &right_def.columns {
+        let col = &col_def.name;
+
+        let mut matches = left_defs
+            .iter()
+            .copied()
+            .filter(|d| table_def_has_column(d, col));
+        let Some(left_def) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some() {
+            return Err(MiniError::Invalid(format!(
+                "ambiguous NATURAL join column: {col}"
+            )));
+        }
+
+        let eq = build_eq_column_expr(&left_def.name, &right_table, col);
+        expr_opt = Some(match expr_opt {
+            None => eq,
+            Some(prev) => build_and_expr(prev, eq),
+        });
+    }
+
+    Ok(expr_opt)
+}
+
+fn extract_equi_join_pairs(
+    expr: &ast::Expr,
+    col_map: &std::collections::HashMap<String, usize>,
+    left_col_count: usize,
+) -> Option<Vec<(usize, usize)>> {
+    fn collect_and_terms<'a>(expr: &'a ast::Expr, out: &mut Vec<&'a ast::Expr>) {
+        match expr {
+            ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => {
+                collect_and_terms(left, out);
+                collect_and_terms(right, out);
+            }
+            other => out.push(other),
+        }
+    }
+
+    let mut terms = Vec::new();
+    collect_and_terms(expr, &mut terms);
+
+    let mut pairs = Vec::new();
+    for term in terms {
+        let ast::Expr::BinaryOp { left, op, right } = term else {
+            return None;
+        };
+        if *op != ast::BinaryOperator::Eq {
+            return None;
+        }
+
+        let l_idx = order_by_expr_to_base_col_idx(left, col_map)?;
+        let r_idx = order_by_expr_to_base_col_idx(right, col_map)?;
+
+        if l_idx < left_col_count && r_idx >= left_col_count {
+            pairs.push((l_idx, r_idx - left_col_count));
+        } else if r_idx < left_col_count && l_idx >= left_col_count {
+            pairs.push((r_idx, l_idx - left_col_count));
+        } else {
+            return None;
+        }
+    }
+
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs)
+    }
+}
+
+fn eval_equi_join_pairs(left: &Row, right: &Row, pairs: &[(usize, usize)]) -> bool {
+    for (l_idx, r_idx) in pairs {
+        let Some(l) = left.values.get(*l_idx) else {
+            return false;
+        };
+        let Some(r) = right.values.get(*r_idx) else {
+            return false;
+        };
+        if matches!(l, Cell::Null) || matches!(r, Cell::Null) {
+            return false;
+        }
+        if compare_cell_for_order(l, r) != std::cmp::Ordering::Equal {
+            return false;
+        }
+    }
+    true
 }
 
 fn compare_cell_for_order(a: &Cell, b: &Cell) -> std::cmp::Ordering {

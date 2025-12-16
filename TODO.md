@@ -29,8 +29,8 @@ These are **not** compatibility guarantees — they are simply what currently wo
 - [x] MySQL protocol handshake (basic) + `mysql_native_password` auth.
 - [x] Basic catalog: databases + tables stored in embedded KV (`sled`).
 - [x] DDL subset: `CREATE/DROP DATABASE`, `USE`, `CREATE/DROP TABLE`, `ALTER TABLE ... ADD COLUMN` (currently requires INT/BIGINT PRIMARY KEY).
-- [x] DML subset: `INSERT ... VALUES` (multi-row), basic `UPDATE`/`DELETE`, `SELECT ... FROM ...` (multi-table subset with INNER JOIN / comma joins).
-- [x] Query subset: basic `WHERE` comparisons, `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`.
+- [x] DML subset: `INSERT ... VALUES` (multi-row), basic `UPDATE`/`DELETE`, `SELECT ... FROM ...` (multi-table subset with INNER/LEFT/RIGHT JOIN + comma joins).
+- [x] Query subset: basic `WHERE` (`AND/OR/NOT`, comparisons, `IS NULL/IS NOT NULL`, `IN (...)`, `LIKE`, `BETWEEN` with tri-valued NULL semantics), `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`.
 - [x] Aggregation subset: `COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`, `HAVING` (limited semantics).
 - [x] Type subset: integers/text plus `FLOAT`, `DATE`, `DATETIME` (limited semantics).
 - [x] Prepared statements: COM_STMT_PREPARE/EXECUTE bridged to text queries (limited types).
@@ -276,7 +276,11 @@ MariaDB-specific DDL surface:
 - [ ] Joins:
   - [x] Nested loop INNER JOIN (and comma joins / CROSS join).
   - [x] Table aliases in FROM/JOIN.
-  - [ ] LEFT/RIGHT/FULL OUTER JOIN semantics.
+  - [x] LEFT JOIN semantics.
+  - [x] `JOIN ... USING(...)` constraints (converted to `ON`).
+  - [x] `NATURAL [LEFT] JOIN` constraints (converted to `USING`-style equality on common columns).
+  - [x] RIGHT JOIN semantics.
+  - [ ] FULL OUTER JOIN semantics.
   - [ ] Hash join.
   - [ ] Merge join.
 - [ ] Aggregations: hash/sort aggregate; GROUP BY/HAVING; rollup/cube where applicable.
@@ -443,6 +447,7 @@ MariaDB adds additional variables/modes:
 ## 18) Testing, CI, and Quality
 
 - [ ] Expand integration tests to cover each newly implemented feature.
+- [x] Add CI gates: GitHub Actions runs `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test`.
 - [ ] Concurrency tests:
   - [ ] randomized transactions, deadlocks, lock waits, isolation anomalies.
 - [ ] Crash/recovery tests:
@@ -453,7 +458,9 @@ MariaDB adds additional variables/modes:
 - [ ] Compatibility harness:
   - [ ] run subset of MySQL MTR and MariaDB tests in CI.
 - [ ] Static analysis:
-  - [ ] `cargo clippy -D warnings`, `cargo audit` (supply chain), sanitizer runs (ASAN/TSAN where possible).
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings` (CI-gated).
+  - [ ] `cargo audit` (supply chain).
+  - [ ] Sanitizer runs (ASAN/TSAN where possible).
 
 ---
 
