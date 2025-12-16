@@ -1,0 +1,98 @@
+name: Release (alpha-mvp)
+
+on:
+  push:
+    tags:
+      - "alpha-mvp*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: rusty-mini-mysql
+            archive: rusty-mini-mysql-linux-x86_64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: rusty-mini-mysql.exe
+            archive: rusty-mini-mysql-windows-x86_64.zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary: rusty-mini-mysql
+            archive: rusty-mini-mysql-macos-x86_64.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "target/${{ matrix.target }}/release"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            7z a "../../../${{ matrix.archive }}" "${{ matrix.binary }}"
+          else
+            tar -czf "../../../${{ matrix.archive }}" "${{ matrix.binary }}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: dist/**/*
+          body: |
+            # alpha-mvp
+
+            This is an **alpha/MVP** MySQL-protocol-compatible server build. It is **not production-ready** (no WAL/durability story, incomplete MySQL 8.0/MariaDB compatibility, incomplete isolation semantics).
+
+            ## Minimal usage
+
+            1) Download the asset for your OS and extract it.
+            2) Run:
+               - `./rusty-mini-mysql --listen 127.0.0.1:3307 --data ./data --root-password root`
+            3) Connect:
+               - `mysql -h 127.0.0.1 -P 3307 -u root -proot`
+
+            ## What works (subset)
+            - Handshake + `mysql_native_password` auth
+            - Basic DDL/DML + joins + WHERE ops + aggregates (see `README.md`)
+            - `CREATE INDEX` (subset; non-unique, single-column; maintained on writes)
+            - Transactions (basic): `BEGIN/COMMIT/ROLLBACK` + savepoints

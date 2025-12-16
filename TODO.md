@@ -21,6 +21,7 @@ These items keep the project maintainable as multiple agents iterate.
 
 - [x] Require agents to read `status.md` (documented in `README.md`).
 - [x] Log every change run under `status/` (see `status.md` for format).
+- [x] GitHub Actions release workflow builds `alpha-mvp` binaries (Linux/Windows/macOS) and publishes a prerelease.
 
 ## 0) Current State (What Exists Today)
 
