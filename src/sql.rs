@@ -1,7 +1,7 @@
 use crate::auth::{has_priv, Priv};
 use crate::error::MiniError;
-use crate::model::{Cell, ColumnDef, Row, SqlType, TableDef, UserRecord};
-use crate::store::Store;
+use crate::model::{Cell, ColumnDef, IndexDef, Row, SqlType, TableDef, UserRecord, TransactionId};
+use crate::store::{Store, ReadView};
 use opensrv_mysql::{Column, ColumnFlags, ColumnType};
 use regex::Regex;
 
@@ -55,6 +55,8 @@ impl SessionState {
 #[derive(Debug, Default, Clone)]
 struct TransactionState {
     in_txn: bool,
+    tx_id: Option<TransactionId>,
+    read_view: Option<ReadView>,
     pending_rows: BTreeMap<RowKey, Option<Row>>,
     savepoints: Vec<(String, BTreeMap<RowKey, Option<Row>>)>,
 }
@@ -489,6 +491,50 @@ fn try_handle_show_index(
         Err(e) => return Some(Err(e)),
     };
 
+    let mut rows = Vec::new();
+    
+    // 1. PRIMARY KEY
+    rows.push(vec![
+        Cell::Text(def.name.clone()),
+        Cell::Int(0),
+        Cell::Text("PRIMARY".into()),
+        Cell::Int(1),
+        Cell::Text(pk_name.clone()),
+        Cell::Text("A".into()),
+        Cell::Int(cardinality),
+        Cell::Null,
+        Cell::Null,
+        Cell::Text(if pk_nullable { "YES" } else { "NO" }.into()),
+        Cell::Text("BTREE".into()),
+        Cell::Text("".into()),
+        Cell::Text("".into()),
+        Cell::Text("YES".into()),
+        Cell::Null,
+    ]);
+
+    // 2. Secondary Indexes
+    for idx in &def.indexes {
+        for (seq, col) in idx.columns.iter().enumerate() {
+            rows.push(vec![
+                Cell::Text(def.name.clone()),
+                Cell::Int(1), // Non_unique
+                Cell::Text(idx.name.clone()),
+                Cell::Int((seq + 1) as i64),
+                Cell::Text(col.clone()),
+                Cell::Text("A".into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+                Cell::Text("YES".into()),
+                Cell::Text("BTREE".into()),
+                Cell::Text("".into()),
+                Cell::Text("".into()),
+                Cell::Text("YES".into()),
+                Cell::Null,
+            ]);
+        }
+    }
+
     Some(Ok(ExecOutput::ResultSet {
         columns: vec![
             Column {
@@ -582,26 +628,9 @@ fn try_handle_show_index(
                 colflags: ColumnFlags::empty(),
             },
         ],
-        rows: vec![vec![
-            Cell::Text(def.name),
-            Cell::Int(0),
-            Cell::Text("PRIMARY".into()),
-            Cell::Int(1),
-            Cell::Text(pk_name),
-            Cell::Text("A".into()),
-            Cell::Int(cardinality),
-            Cell::Null,
-            Cell::Null,
-            Cell::Text(if pk_nullable { "YES" } else { "NO" }.into()),
-            Cell::Text("BTREE".into()),
-            Cell::Text("".into()),
-            Cell::Text("".into()),
-            Cell::Text("YES".into()),
-            Cell::Null,
-        ]],
+        rows,
     }))
 }
-
 fn try_handle_show_table_status(
     query: &str,
     store: &Store,
@@ -874,6 +903,11 @@ pub fn execute(
     let stmt = &ast[0];
     match stmt {
         Statement::StartTransaction { .. } => {
+            // Implicitly commit previous if exists (MySQL behavior)
+            if session.txn.tx_id.is_some() {
+                txn_commit(store, session)?;
+            }
+            ensure_txn_active(store, session);
             session.txn.in_txn = true;
             Ok(ExecOutput::Ok {
                 affected_rows: 0,
@@ -883,6 +917,8 @@ pub fn execute(
         }
         Statement::Commit { .. } => {
             txn_commit(store, session)?;
+            // Explicit commit ends the transaction block.
+            session.txn.in_txn = false;
             Ok(ExecOutput::Ok {
                 affected_rows: 0,
                 last_insert_id: 0,
@@ -895,6 +931,7 @@ pub fn execute(
         } => handle_rollback_to_savepoint(session, name),
         Statement::Rollback { .. } => {
             txn_rollback(store, session);
+            session.txn.in_txn = false;
             Ok(ExecOutput::Ok {
                 affected_rows: 0,
                 last_insert_id: 0,
@@ -903,89 +940,100 @@ pub fn execute(
         }
         Statement::Savepoint { name } => handle_savepoint(session, name),
         Statement::ReleaseSavepoint { name } => handle_release_savepoint(session, name),
-        Statement::Set(set) => handle_set(store, session, set),
-        Statement::CreateDatabase {
-            db_name,
-            if_not_exists,
-            ..
-        } => handle_create_database(store, session, user, db_name, *if_not_exists),
-        Statement::Drop {
-            object_type: ast::ObjectType::Schema | ast::ObjectType::Database,
-            names,
-            if_exists,
-            ..
-        } => {
-            if names.is_empty() {
-                return Err(MiniError::Parse("No database name".into()));
-            }
-            handle_drop_database(store, session, user, &names[0], *if_exists)
+        Statement::ShowColumns { .. } | Statement::ShowCreate { .. } => {
+             // These use internal helpers that don't scan rows usually, or use store.get_table which is catalog.
+             // Catalog is not MVCC yet.
+             // But let's ensure we are in a txn just in case.
+             ensure_txn_active(store, session);
+             match stmt {
+                 Statement::ShowColumns { .. } => handle_show_columns(store, session, user, stmt),
+                 Statement::ShowCreate { .. } => handle_show_create(store, session, user, stmt),
+                 _ => unreachable!(),
+             }
         }
-        Statement::CreateTable(c) => handle_create_table(
-            store,
-            session,
-            user,
-            &c.name,
-            &c.columns,
-            &c.constraints,
-            c.if_not_exists,
-        ),
-        Statement::AlterTable(alter) => handle_alter_table(store, session, user, alter),
-        Statement::Drop {
-            object_type: ast::ObjectType::Table,
-            names,
-            if_exists,
-            ..
-        } => {
-            if names.is_empty() {
-                return Err(MiniError::Parse("No table name".into()));
-            }
-            handle_drop_table(store, session, user, &names[0], *if_exists)
-        }
-        Statement::Use(use_stmt) => handle_use(store, session, use_stmt),
-        Statement::ShowDatabases { show_options, .. } => {
-            handle_show_databases(store, session, user, show_options)
-        }
-        Statement::ShowTables {
-            full, show_options, ..
-        } => handle_show_tables(store, session, user, *full, show_options),
-        Statement::ShowColumns {
-            extended,
-            full,
-            show_options,
-        } => handle_show_columns(store, session, user, *extended, *full, show_options),
-        Statement::ShowCreate { obj_type, obj_name } => {
-            handle_show_create(store, session, user, obj_type, obj_name)
-        }
-        Statement::ExplainTable { table_name, .. } => {
-            handle_describe_table(store, session, user, table_name)
-        }
-        Statement::Query(query) => handle_query(store, session, user, query),
-        Statement::Insert(i) => {
-            if let Some(src) = &i.source {
-                let table_name = match &i.table {
-                    ast::TableObject::TableName(name) => name,
-                    _ => {
-                        return Err(MiniError::NotSupported(
-                            "Complex table insert not supported".into(),
-                        ));
+        // Catch-all for other statements that need implicit txn
+        _ => {
+            ensure_txn_active(store, session);
+            let res = match stmt {
+                Statement::Set(set) => handle_set(store, session, set),
+                Statement::CreateDatabase {
+                    db_name,
+                    if_not_exists,
+                    ..
+                } => handle_create_database(store, session, user, db_name, *if_not_exists),
+                Statement::Drop {
+                    object_type: ast::ObjectType::Schema | ast::ObjectType::Database,
+                    names,
+                    if_exists,
+                    ..
+                } => {
+                    if names.is_empty() {
+                        return Err(MiniError::Parse("No database name".into()));
                     }
-                };
-                handle_insert(store, session, user, table_name, &i.columns, src)
-            } else {
-                Err(MiniError::Parse("INSERT missing source".into()))
+                    handle_drop_database(store, session, user, &names[0], *if_exists)
+                }
+                Statement::CreateTable(c) => handle_create_table(
+                    store,
+                    session,
+                    user,
+                    &c.name,
+                    &c.columns,
+                    &c.constraints,
+                    c.if_not_exists,
+                ),
+                Statement::AlterTable(alter) => handle_alter_table(store, session, user, alter),
+                Statement::Drop {
+                    object_type: ast::ObjectType::Table,
+                    names,
+                    if_exists,
+                    ..
+                } => {
+                    if names.is_empty() {
+                        return Err(MiniError::Parse("No table name".into()));
+                    }
+                    handle_drop_table(store, session, user, &names[0], *if_exists)
+                }
+                Statement::Use(use_stmt) => handle_use(store, session, use_stmt),
+                Statement::ShowDatabases { show_options, .. } => {
+                    handle_show_databases(store, session, user, show_options)
+                }
+                Statement::ShowTables { .. } => handle_show_tables(store, session, user, stmt),
+                Statement::CreateIndex(ast::CreateIndex {
+                    name,
+                    table_name,
+                    columns,
+                    unique,
+                    if_not_exists,
+                    ..
+                }) => handle_create_index(store, session, user, name, table_name, columns, *unique, *if_not_exists),
+                Statement::ExplainTable { table_name, .. } => {
+                    handle_describe_table(store, session, user, table_name)
+                }
+                Statement::Query(q) => handle_query(store, session, user, q),
+                Statement::Insert(insert) => handle_insert(store, session, user, insert),
+                Statement::Update(update) => handle_update(store, session, user, update),
+                Statement::Delete(delete) => handle_delete(store, session, user, delete),
+                Statement::ShowVariables {
+                    filter,
+                    global,
+                    session: session_scope,
+                } => handle_show_variables(session, filter.as_ref(), *global, *session_scope),
+                _ => Err(MiniError::NotSupported(format!(
+                    "Statement not implemented: {:?}",
+                    stmt
+                ))),
+            };
+            
+            // Implicit Commit if needed
+            if !session.txn.in_txn {
+                 if res.is_ok() {
+                     txn_commit(store, session)?;
+                 } else {
+                     txn_rollback(store, session);
+                 }
             }
+            res
         }
-        Statement::Update(update) => handle_update(store, session, user, update),
-        Statement::Delete(delete) => handle_delete(store, session, user, delete),
-        Statement::ShowVariables {
-            filter,
-            global,
-            session: session_scope,
-        } => handle_show_variables(session, filter.as_ref(), *global, *session_scope),
-        _ => Err(MiniError::NotSupported(format!(
-            "Statement not implemented: {:?}",
-            stmt
-        ))),
     }
 }
 
@@ -1196,11 +1244,17 @@ fn handle_show_databases(
 
 fn handle_show_tables(
     store: &Store,
-    session: &SessionState,
+    session: &mut SessionState,
     user: &UserRecord,
-    full: bool,
-    show_options: &ast::ShowStatementOptions,
+    stmt: &Statement,
 ) -> Result<ExecOutput, MiniError> {
+    let (full, show_options) = match stmt {
+        Statement::ShowTables {
+            full, show_options, ..
+        } => (*full, show_options),
+        _ => unreachable!(),
+    };
+
     let db = show_options
         .show_in
         .as_ref()
@@ -1272,12 +1326,19 @@ fn handle_show_tables(
 
 fn handle_show_columns(
     store: &Store,
-    session: &SessionState,
+    session: &mut SessionState,
     user: &UserRecord,
-    _extended: bool,
-    full: bool,
-    show_options: &ast::ShowStatementOptions,
+    stmt: &Statement,
 ) -> Result<ExecOutput, MiniError> {
+    let (extended, full, show_options) = match stmt {
+        Statement::ShowColumns {
+            extended,
+            full,
+            show_options,
+        } => (*extended, *full, show_options),
+        _ => unreachable!(),
+    };
+
     require_priv(user, session.current_db.as_deref(), Priv::SELECT)?;
 
     let Some(show_in) = &show_options.show_in else {
@@ -1333,11 +1394,15 @@ fn handle_describe_table(
 
 fn handle_show_create(
     store: &Store,
-    session: &SessionState,
+    session: &mut SessionState,
     user: &UserRecord,
-    obj_type: &ast::ShowCreateObject,
-    obj_name: &ObjectName,
+    stmt: &Statement,
 ) -> Result<ExecOutput, MiniError> {
+    let (obj_type, obj_name) = match stmt {
+        Statement::ShowCreate { obj_type, obj_name } => (obj_type, obj_name),
+        _ => unreachable!(),
+    };
+
     require_priv(user, session.current_db.as_deref(), Priv::SELECT)?;
     if *obj_type != ast::ShowCreateObject::Table {
         return Err(MiniError::NotSupported(
@@ -1656,8 +1721,8 @@ fn handle_rollback_to_savepoint(
         .rposition(|(n, _)| n.eq_ignore_ascii_case(&name.value))
         .ok_or_else(|| MiniError::NotFound(format!("unknown savepoint: {}", name.value)))?;
 
-    let snapshot = session.txn.savepoints[pos].1.clone();
-    session.txn.pending_rows = snapshot;
+    let snapshot = session.txn.pending_rows.clone(); // Snapshot is not used, it should be restored from.
+    session.txn.pending_rows = session.txn.savepoints[pos].1.clone();
     session.txn.savepoints.truncate(pos + 1);
 
     Ok(ExecOutput::Ok {
@@ -1694,11 +1759,22 @@ fn handle_insert(
     store: &Store,
     session: &mut SessionState,
     user: &UserRecord,
-    table_name: &ObjectName,
-    columns: &[Ident],
-    source: &ast::Query,
+    insert: &ast::Insert,
 ) -> Result<ExecOutput, MiniError> {
     require_priv(user, session.current_db.as_deref(), Priv::INSERT)?;
+
+    let Some(src) = &insert.source else {
+        return Err(MiniError::Parse("INSERT missing source".into()));
+    };
+
+    let table_name = match &insert.table {
+        ast::TableObject::TableName(name) => name,
+        _ => {
+            return Err(MiniError::NotSupported(
+                "Complex table insert not supported".into(),
+            ));
+        }
+    };
 
     let (db_opt, table) = object_name_to_parts(table_name)?;
     let db = db_opt
@@ -1706,14 +1782,14 @@ fn handle_insert(
         .ok_or_else(|| MiniError::Invalid("no database selected".into()))?;
     let def = store.get_table(&db, &table)?;
 
-    let cols: Vec<String> = if columns.is_empty() {
+    let cols: Vec<String> = if insert.columns.is_empty() {
         def.columns.iter().map(|c| c.name.clone()).collect()
     } else {
-        columns.iter().map(|c| c.value.clone()).collect()
+        insert.columns.iter().map(|c| c.value.clone()).collect()
     };
 
     // Extract rows from source
-    let rows_exprs = match &source.body.as_ref() {
+    let rows_exprs = match &src.body.as_ref() {
         SetExpr::Values(values) => &values.rows,
         _ => {
             return Err(MiniError::NotSupported(
@@ -2776,6 +2852,7 @@ fn information_schema_schemata_def() -> TableDef {
         ],
         primary_key: "SCHEMA_NAME".into(),
         auto_increment: false,
+        indexes: vec![],
     }
 }
 
@@ -2892,6 +2969,7 @@ fn information_schema_tables_def() -> TableDef {
         ],
         primary_key: "TABLE_NAME".into(),
         auto_increment: false,
+        indexes: vec![],
     }
 }
 
@@ -3003,6 +3081,7 @@ fn information_schema_columns_def() -> TableDef {
         ],
         primary_key: "COLUMN_NAME".into(),
         auto_increment: false,
+        indexes: vec![],
     }
 }
 
@@ -3104,6 +3183,7 @@ fn information_schema_statistics_def() -> TableDef {
         ],
         primary_key: "INDEX_NAME".into(),
         auto_increment: false,
+        indexes: vec![],
     }
 }
 
@@ -4657,6 +4737,7 @@ fn txn_get_row(
     table: &str,
     pk: i64,
 ) -> Result<Option<Row>, MiniError> {
+    // Check local writes first (Read My Own Writes)
     if !session.txn.pending_rows.is_empty() {
         let key = RowKey {
             db: db.to_string(),
@@ -4667,7 +4748,9 @@ fn txn_get_row(
             return Ok(v.clone());
         }
     }
-    store.get_row(db, table, pk)
+    // Fallback to store
+    let view = session.txn.read_view.as_ref().ok_or_else(|| MiniError::Invalid("No active transaction view".into()))?;
+    store.get_row_mvcc(db, table, pk, view)
 }
 
 fn txn_scan_rows(
@@ -4676,7 +4759,9 @@ fn txn_scan_rows(
     db: &str,
     table: &str,
 ) -> Result<Vec<(i64, Row)>, MiniError> {
-    let base = store.scan_rows(db, table)?;
+    let view = session.txn.read_view.as_ref().ok_or_else(|| MiniError::Invalid("No active transaction view".into()))?;
+    let base = store.scan_rows_mvcc(db, table, view)?;
+    
     if session.txn.pending_rows.is_empty() {
         return Ok(base);
     }
@@ -4697,26 +4782,42 @@ fn txn_scan_rows(
     Ok(merged.into_iter().collect())
 }
 
-fn txn_commit(store: &Store, session: &mut SessionState) -> Result<(), MiniError> {
-    if !session.txn.pending_rows.is_empty() {
-        let changes = session
-            .txn
-            .pending_rows
-            .iter()
-            .map(|(k, v)| (k.db.as_str(), k.table.as_str(), k.pk, v.as_ref()));
-        store.apply_row_changes(changes)?;
+fn ensure_txn_active(store: &Store, session: &mut SessionState) {
+    if session.txn.tx_id.is_none() {
+         let (tx, view) = store.txn_manager.start_txn();
+         session.txn.tx_id = Some(tx);
+         session.txn.read_view = Some(view);
     }
+}
+
+fn txn_commit(store: &Store, session: &mut SessionState) -> Result<(), MiniError> {
+    if let Some(tx_id) = session.txn.tx_id {
+        if !session.txn.pending_rows.is_empty() {
+             // Convert BTreeMap iterator to what apply_row_changes_mvcc expects
+             let changes = session.txn.pending_rows.iter().map(|(k, v)| {
+                 (k.db.as_str(), k.table.as_str(), k.pk, v.as_ref())
+             });
+             store.apply_row_changes_mvcc(changes, tx_id)?;
+        }
+        store.txn_manager.commit_txn(tx_id);
+    }
+    
+    session.txn.tx_id = None;
+    session.txn.read_view = None;
     session.txn.pending_rows.clear();
     session.txn.savepoints.clear();
-    session.txn.in_txn = false;
     store.unlock_all(session.conn_id);
     Ok(())
 }
 
 fn txn_rollback(store: &Store, session: &mut SessionState) {
+    if let Some(tx_id) = session.txn.tx_id {
+        store.txn_manager.rollback_txn(tx_id);
+    }
+    session.txn.tx_id = None;
+    session.txn.read_view = None;
     session.txn.pending_rows.clear();
     session.txn.savepoints.clear();
-    session.txn.in_txn = false;
     store.unlock_all(session.conn_id);
 }
 
@@ -4774,6 +4875,72 @@ fn handle_drop_database(
         affected_rows: 1,
         last_insert_id: 0,
         info: "".into(),
+    })
+}
+
+fn handle_create_index(
+    store: &Store,
+    session: &mut SessionState,
+    user: &UserRecord,
+    name: &Option<ast::ObjectName>,
+    table_name: &ObjectName,
+    columns: &[ast::IndexColumn],
+    unique: bool,
+    if_not_exists: bool,
+) -> Result<ExecOutput, MiniError> {
+    require_priv(user, session.current_db.as_deref(), Priv::CREATE)?; // Create priv
+    txn_commit(store, session)?; // Implicit commit
+
+    let (db_opt, table) = object_name_to_parts(table_name)?;
+    let db = db_opt
+        .or_else(|| session.current_db.clone())
+        .ok_or_else(|| MiniError::Invalid("no database selected".into()))?;
+
+    // Index Name
+    let idx_name = if let Some(n) = name {
+        // ObjectName to string (last part)
+        get_ident_name(n.0.last().unwrap())
+    } else {
+        // Auto-generate name based on column?
+        if columns.is_empty() {
+             return Err(MiniError::Parse("Index requires columns".into()));
+        }
+        let expr = &columns[0].column.expr;
+        match expr {
+            ast::Expr::Identifier(ident) => format!("idx_{}", ident.value),
+            _ => "idx_unknown".to_string(),
+        }
+    };
+    
+    if unique {
+        return Err(MiniError::NotSupported("UNIQUE index not supported in MVP".into()));
+    }
+
+    let mut col_names = Vec::new();
+    for col in columns {
+        match &col.column.expr {
+             ast::Expr::Identifier(ident) => col_names.push(ident.value.clone()),
+             _ => return Err(MiniError::NotSupported("Index on complex expr not supported".into())),
+        }
+    }
+
+    let index_def = IndexDef {
+        name: idx_name,
+        columns: col_names,
+    };
+
+    match store.create_index(&db, &table, index_def) {
+        Ok(_) => {},
+        Err(MiniError::Invalid(msg)) if if_not_exists && msg.contains("already exists") => {
+             // Ignore
+        },
+        Err(e) => return Err(e),
+    }
+
+    Ok(ExecOutput::Ok {
+        affected_rows: 0,
+        last_insert_id: 0,
+        info: "Index created".into(),
     })
 }
 
@@ -4888,6 +5055,7 @@ fn handle_create_table(
         columns: my_columns,
         primary_key: pk,
         auto_increment: table_auto_increment,
+        indexes: vec![],
     };
 
     match store.create_table(&def) {
@@ -5091,4 +5259,76 @@ fn handle_drop_table(
         last_insert_id: 0,
         info: "".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_secondary_index_flow() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.ensure_root_user("").unwrap();
+
+        let mut session = SessionState::new(1);
+        session.current_db = Some("test".into());
+        let user = UserRecord {
+            username: "root".into(),
+            host: "%".into(),
+            plugin: "".into(),
+            auth_stage2: None,
+            global_privs: Priv::ALL.bits(),
+            db_privs: Default::default(),
+        };
+
+        // 1. Create DB and Table
+        let setup_sqls = vec![
+            "CREATE DATABASE test",
+            "CREATE TABLE users (id INT, name TEXT, age INT, PRIMARY KEY (id))",
+            "INSERT INTO users VALUES (1, 'Alice', 30)",
+            "INSERT INTO users VALUES (2, 'Bob', 25)",
+        ];
+        for sql in setup_sqls {
+            match execute(sql, &store, &mut session, &user) {
+                Ok(_) => {},
+                Err(e) => panic!("Failed to run {}: {:?}", sql, e),
+            }
+        }
+
+        // 2. Create Index
+        // Should succeed and backfill
+        match execute("CREATE INDEX idx_age ON users (age)", &store, &mut session, &user) {
+            Ok(_) => {},
+            Err(e) => panic!("Failed to create index: {:?}", e),
+        }
+
+        // 3. Show Index
+        let res = execute("SHOW INDEX FROM users", &store, &mut session, &user).unwrap();
+        match res {
+            ExecOutput::ResultSet { rows, .. } => {
+                // Expected: PRIMARY (seq 1), idx_age (seq 1)
+                assert_eq!(rows.len(), 2, "Should have 2 index rows (PRIMARY + idx_age)");
+                
+                // Row 1: PRIMARY
+                let row0 = &rows[0];
+                assert_eq!(row0[2], Cell::Text("PRIMARY".into()));
+                
+                // Row 2: idx_age
+                let row1 = &rows[1];
+                // Table, Non_unique, Key_name...
+                // Key_name is index 2
+                assert_eq!(row1[2], Cell::Text("idx_age".into()));
+                assert_eq!(row1[4], Cell::Text("age".into())); // Column_name
+            },
+            _ => panic!("Expected ResultSet"),
+        }
+
+        // 4. Insert more data (updates index)
+        match execute("INSERT INTO users VALUES (3, 'Charlie', 35)", &store, &mut session, &user) {
+            Ok(_) => {},
+            Err(e) => panic!("Failed to insert after index: {:?}", e),
+        }
+    }
 }

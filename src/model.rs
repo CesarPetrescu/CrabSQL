@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 
+pub type TransactionId = u64;
+pub const TX_ID_NONE: TransactionId = 0;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SqlType {
     Int,
@@ -18,10 +21,19 @@ pub struct ColumnDef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexDef {
+    pub name: String,
+    pub columns: Vec<String>,
+    // Potentially Unique flag in future
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub db: String,
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    #[serde(default)]
+    pub indexes: Vec<IndexDef>,
     pub primary_key: String,
     #[serde(default)]
     pub auto_increment: bool,
