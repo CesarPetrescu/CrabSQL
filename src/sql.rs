@@ -1,7 +1,7 @@
 use crate::auth::{has_priv, Priv};
 use crate::error::MiniError;
-use crate::model::{Cell, ColumnDef, IndexDef, Row, SqlType, TableDef, UserRecord, TransactionId};
-use crate::store::{Store, ReadView};
+use crate::model::{Cell, ColumnDef, IndexDef, Row, SqlType, TableDef, TransactionId, UserRecord};
+use crate::store::{ReadView, Store};
 use opensrv_mysql::{Column, ColumnFlags, ColumnType};
 use regex::Regex;
 
@@ -492,7 +492,7 @@ fn try_handle_show_index(
     };
 
     let mut rows = Vec::new();
-    
+
     // 1. PRIMARY KEY
     rows.push(vec![
         Cell::Text(def.name.clone()),
@@ -941,15 +941,15 @@ pub fn execute(
         Statement::Savepoint { name } => handle_savepoint(session, name),
         Statement::ReleaseSavepoint { name } => handle_release_savepoint(session, name),
         Statement::ShowColumns { .. } | Statement::ShowCreate { .. } => {
-             // These use internal helpers that don't scan rows usually, or use store.get_table which is catalog.
-             // Catalog is not MVCC yet.
-             // But let's ensure we are in a txn just in case.
-             ensure_txn_active(store, session);
-             match stmt {
-                 Statement::ShowColumns { .. } => handle_show_columns(store, session, user, stmt),
-                 Statement::ShowCreate { .. } => handle_show_create(store, session, user, stmt),
-                 _ => unreachable!(),
-             }
+            // These use internal helpers that don't scan rows usually, or use store.get_table which is catalog.
+            // Catalog is not MVCC yet.
+            // But let's ensure we are in a txn just in case.
+            ensure_txn_active(store, session);
+            match stmt {
+                Statement::ShowColumns { .. } => handle_show_columns(store, session, user, stmt),
+                Statement::ShowCreate { .. } => handle_show_create(store, session, user, stmt),
+                _ => unreachable!(),
+            }
         }
         // Catch-all for other statements that need implicit txn
         _ => {
@@ -998,14 +998,9 @@ pub fn execute(
                     handle_show_databases(store, session, user, show_options)
                 }
                 Statement::ShowTables { .. } => handle_show_tables(store, session, user, stmt),
-                Statement::CreateIndex(ast::CreateIndex {
-                    name,
-                    table_name,
-                    columns,
-                    unique,
-                    if_not_exists,
-                    ..
-                }) => handle_create_index(store, session, user, name, table_name, columns, *unique, *if_not_exists),
+                Statement::CreateIndex(create_index) => {
+                    handle_create_index(store, session, user, create_index)
+                }
                 Statement::ExplainTable { table_name, .. } => {
                     handle_describe_table(store, session, user, table_name)
                 }
@@ -1023,14 +1018,14 @@ pub fn execute(
                     stmt
                 ))),
             };
-            
+
             // Implicit Commit if needed
             if !session.txn.in_txn {
-                 if res.is_ok() {
-                     txn_commit(store, session)?;
-                 } else {
-                     txn_rollback(store, session);
-                 }
+                if res.is_ok() {
+                    txn_commit(store, session)?;
+                } else {
+                    txn_rollback(store, session);
+                }
             }
             res
         }
@@ -1330,7 +1325,7 @@ fn handle_show_columns(
     user: &UserRecord,
     stmt: &Statement,
 ) -> Result<ExecOutput, MiniError> {
-    let (extended, full, show_options) = match stmt {
+    let (_extended, full, show_options) = match stmt {
         Statement::ShowColumns {
             extended,
             full,
@@ -1721,7 +1716,6 @@ fn handle_rollback_to_savepoint(
         .rposition(|(n, _)| n.eq_ignore_ascii_case(&name.value))
         .ok_or_else(|| MiniError::NotFound(format!("unknown savepoint: {}", name.value)))?;
 
-    let snapshot = session.txn.pending_rows.clone(); // Snapshot is not used, it should be restored from.
     session.txn.pending_rows = session.txn.savepoints[pos].1.clone();
     session.txn.savepoints.truncate(pos + 1);
 
@@ -4749,7 +4743,11 @@ fn txn_get_row(
         }
     }
     // Fallback to store
-    let view = session.txn.read_view.as_ref().ok_or_else(|| MiniError::Invalid("No active transaction view".into()))?;
+    let view = session
+        .txn
+        .read_view
+        .as_ref()
+        .ok_or_else(|| MiniError::Invalid("No active transaction view".into()))?;
     store.get_row_mvcc(db, table, pk, view)
 }
 
@@ -4759,9 +4757,13 @@ fn txn_scan_rows(
     db: &str,
     table: &str,
 ) -> Result<Vec<(i64, Row)>, MiniError> {
-    let view = session.txn.read_view.as_ref().ok_or_else(|| MiniError::Invalid("No active transaction view".into()))?;
+    let view = session
+        .txn
+        .read_view
+        .as_ref()
+        .ok_or_else(|| MiniError::Invalid("No active transaction view".into()))?;
     let base = store.scan_rows_mvcc(db, table, view)?;
-    
+
     if session.txn.pending_rows.is_empty() {
         return Ok(base);
     }
@@ -4784,24 +4786,26 @@ fn txn_scan_rows(
 
 fn ensure_txn_active(store: &Store, session: &mut SessionState) {
     if session.txn.tx_id.is_none() {
-         let (tx, view) = store.txn_manager.start_txn();
-         session.txn.tx_id = Some(tx);
-         session.txn.read_view = Some(view);
+        let (tx, view) = store.txn_manager.start_txn();
+        session.txn.tx_id = Some(tx);
+        session.txn.read_view = Some(view);
     }
 }
 
 fn txn_commit(store: &Store, session: &mut SessionState) -> Result<(), MiniError> {
     if let Some(tx_id) = session.txn.tx_id {
         if !session.txn.pending_rows.is_empty() {
-             // Convert BTreeMap iterator to what apply_row_changes_mvcc expects
-             let changes = session.txn.pending_rows.iter().map(|(k, v)| {
-                 (k.db.as_str(), k.table.as_str(), k.pk, v.as_ref())
-             });
-             store.apply_row_changes_mvcc(changes, tx_id)?;
+            // Convert BTreeMap iterator to what apply_row_changes_mvcc expects
+            let changes = session
+                .txn
+                .pending_rows
+                .iter()
+                .map(|(k, v)| (k.db.as_str(), k.table.as_str(), k.pk, v.as_ref()));
+            store.apply_row_changes_mvcc(changes, tx_id)?;
         }
         store.txn_manager.commit_txn(tx_id);
     }
-    
+
     session.txn.tx_id = None;
     session.txn.read_view = None;
     session.txn.pending_rows.clear();
@@ -4882,45 +4886,47 @@ fn handle_create_index(
     store: &Store,
     session: &mut SessionState,
     user: &UserRecord,
-    name: &Option<ast::ObjectName>,
-    table_name: &ObjectName,
-    columns: &[ast::IndexColumn],
-    unique: bool,
-    if_not_exists: bool,
+    create_index: &ast::CreateIndex,
 ) -> Result<ExecOutput, MiniError> {
     require_priv(user, session.current_db.as_deref(), Priv::CREATE)?; // Create priv
     txn_commit(store, session)?; // Implicit commit
 
-    let (db_opt, table) = object_name_to_parts(table_name)?;
+    let (db_opt, table) = object_name_to_parts(&create_index.table_name)?;
     let db = db_opt
         .or_else(|| session.current_db.clone())
         .ok_or_else(|| MiniError::Invalid("no database selected".into()))?;
 
     // Index Name
-    let idx_name = if let Some(n) = name {
+    let idx_name = if let Some(n) = &create_index.name {
         // ObjectName to string (last part)
         get_ident_name(n.0.last().unwrap())
     } else {
         // Auto-generate name based on column?
-        if columns.is_empty() {
-             return Err(MiniError::Parse("Index requires columns".into()));
+        if create_index.columns.is_empty() {
+            return Err(MiniError::Parse("Index requires columns".into()));
         }
-        let expr = &columns[0].column.expr;
+        let expr = &create_index.columns[0].column.expr;
         match expr {
             ast::Expr::Identifier(ident) => format!("idx_{}", ident.value),
             _ => "idx_unknown".to_string(),
         }
     };
-    
-    if unique {
-        return Err(MiniError::NotSupported("UNIQUE index not supported in MVP".into()));
+
+    if create_index.unique {
+        return Err(MiniError::NotSupported(
+            "UNIQUE index not supported in MVP".into(),
+        ));
     }
 
     let mut col_names = Vec::new();
-    for col in columns {
+    for col in &create_index.columns {
         match &col.column.expr {
-             ast::Expr::Identifier(ident) => col_names.push(ident.value.clone()),
-             _ => return Err(MiniError::NotSupported("Index on complex expr not supported".into())),
+            ast::Expr::Identifier(ident) => col_names.push(ident.value.clone()),
+            _ => {
+                return Err(MiniError::NotSupported(
+                    "Index on complex expr not supported".into(),
+                ))
+            }
         }
     }
 
@@ -4930,10 +4936,12 @@ fn handle_create_index(
     };
 
     match store.create_index(&db, &table, index_def) {
-        Ok(_) => {},
-        Err(MiniError::Invalid(msg)) if if_not_exists && msg.contains("already exists") => {
-             // Ignore
-        },
+        Ok(_) => {}
+        Err(MiniError::Invalid(msg))
+            if create_index.if_not_exists && msg.contains("already exists") =>
+        {
+            // Ignore
+        }
         Err(e) => return Err(e),
     }
 
@@ -5292,15 +5300,20 @@ mod tests {
         ];
         for sql in setup_sqls {
             match execute(sql, &store, &mut session, &user) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => panic!("Failed to run {}: {:?}", sql, e),
             }
         }
 
         // 2. Create Index
         // Should succeed and backfill
-        match execute("CREATE INDEX idx_age ON users (age)", &store, &mut session, &user) {
-            Ok(_) => {},
+        match execute(
+            "CREATE INDEX idx_age ON users (age)",
+            &store,
+            &mut session,
+            &user,
+        ) {
+            Ok(_) => {}
             Err(e) => panic!("Failed to create index: {:?}", e),
         }
 
@@ -5309,25 +5322,34 @@ mod tests {
         match res {
             ExecOutput::ResultSet { rows, .. } => {
                 // Expected: PRIMARY (seq 1), idx_age (seq 1)
-                assert_eq!(rows.len(), 2, "Should have 2 index rows (PRIMARY + idx_age)");
-                
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "Should have 2 index rows (PRIMARY + idx_age)"
+                );
+
                 // Row 1: PRIMARY
                 let row0 = &rows[0];
                 assert_eq!(row0[2], Cell::Text("PRIMARY".into()));
-                
+
                 // Row 2: idx_age
                 let row1 = &rows[1];
                 // Table, Non_unique, Key_name...
                 // Key_name is index 2
                 assert_eq!(row1[2], Cell::Text("idx_age".into()));
                 assert_eq!(row1[4], Cell::Text("age".into())); // Column_name
-            },
+            }
             _ => panic!("Expected ResultSet"),
         }
 
         // 4. Insert more data (updates index)
-        match execute("INSERT INTO users VALUES (3, 'Charlie', 35)", &store, &mut session, &user) {
-            Ok(_) => {},
+        match execute(
+            "INSERT INTO users VALUES (3, 'Charlie', 35)",
+            &store,
+            &mut session,
+            &user,
+        ) {
+            Ok(_) => {}
             Err(e) => panic!("Failed to insert after index: {:?}", e),
         }
     }

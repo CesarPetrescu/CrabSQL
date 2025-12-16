@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt;
 
 pub type TransactionId = u64;
-pub const TX_ID_NONE: TransactionId = 0;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SqlType {
     Int,

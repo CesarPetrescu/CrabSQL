@@ -28,13 +28,13 @@ These are **not** compatibility guarantees — they are simply what currently wo
 
 - [x] MySQL protocol handshake (basic) + `mysql_native_password` auth.
 - [x] Basic catalog: databases + tables stored in embedded KV (`sled`).
-- [x] DDL subset: `CREATE/DROP DATABASE`, `USE`, `CREATE/DROP TABLE`, `ALTER TABLE ... ADD COLUMN` (currently requires INT/BIGINT PRIMARY KEY).
+- [x] DDL subset: `CREATE/DROP DATABASE`, `USE`, `CREATE/DROP TABLE`, `ALTER TABLE ... ADD COLUMN`, `CREATE INDEX` (subset; non-unique, single-column).
 - [x] DML subset: `INSERT ... VALUES` (multi-row), basic `UPDATE`/`DELETE`, `SELECT ... FROM ...` (multi-table subset with INNER/LEFT/RIGHT JOIN + comma joins).
 - [x] Query subset: basic `WHERE` (`AND/OR/NOT`, comparisons, `IS NULL/IS NOT NULL`, `IN (...)`, `LIKE`, `BETWEEN` with tri-valued NULL semantics), `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`.
 - [x] Aggregation subset: `COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`, `HAVING` (limited semantics).
 - [x] Type subset: integers/text plus `FLOAT`, `DATE`, `DATETIME` (limited semantics).
 - [x] Prepared statements: COM_STMT_PREPARE/EXECUTE bridged to text queries (limited types).
-- [x] Transactions (partial): session-local write buffering + atomic commit; savepoints; basic row write locks.
+- [x] Transactions (partial): MVCC row versions + snapshot read views; session-local write buffering overlay; savepoints; basic row write locks.
 
 ---
 
@@ -199,7 +199,7 @@ MariaDB adds/changes metadata expectations:
 ### 6.3 SHOW/DESCRIBE/EXPLAIN Parity
 - [x] `SHOW DATABASES`, `SHOW TABLES`, `SHOW FULL TABLES`.
 - [x] `SHOW COLUMNS` / `SHOW FULL COLUMNS` / `DESCRIBE`.
-- [x] `SHOW INDEX` (primary key only).
+- [x] `SHOW INDEX` (PRIMARY + secondary indexes; subset).
 - [x] `SHOW CREATE TABLE` (simplified output).
 - [x] `SHOW VARIABLES` (minimal curated set + `SELECT @@var` support).
 - [ ] `SHOW STATUS`.
@@ -301,6 +301,7 @@ MariaDB-specific DDL surface:
 ## 10) Indexing, Constraints, and Storage Layout
 
 ### 10.1 Index Types
+Note: a minimal non-unique, single-column `CREATE INDEX` exists and is maintained on writes, but indexes are not used for query planning yet.
 - [ ] Primary index (clustered, InnoDB-like).
 - [ ] Secondary indexes (unique/non-unique).
 - [ ] Composite indexes, prefix indexes.
@@ -334,6 +335,7 @@ This is the biggest gap between “toy SQL engine” and “real MySQL”.
 - [ ] Statement atomicity for all DML (not only some statements).
 
 ### 11.2 MVCC
+Note: the storage layer persists per-row version chains keyed by TxID and uses read views for snapshot-style reads, but there is no undo log, no purge/GC, and no InnoDB-level MVCC semantics.
 - [ ] Multi-version records (undo logs / version chains).
 - [ ] Consistent snapshot reads (REPEATABLE READ default).
 - [ ] Read view creation rules (MySQL InnoDB-like).

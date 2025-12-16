@@ -17,6 +17,7 @@ If you (human or AI agent) are making changes:
   - `CREATE DATABASE [IF NOT EXISTS]`, `DROP DATABASE [IF EXISTS]`, `USE`
   - `CREATE TABLE [IF NOT EXISTS]` (subset; **requires an INT/BIGINT PRIMARY KEY**)
   - `ALTER TABLE ... ADD COLUMN ...` (subset; appends columns only)
+  - `CREATE INDEX ...` (subset; non-unique, single-column; maintained on writes)
   - `DROP TABLE [IF EXISTS]`
 - Basic DML:
   - `INSERT INTO ... VALUES ...`
@@ -40,8 +41,8 @@ If you (human or AI agent) are making changes:
 - FULL OUTER joins, join reordering/optimization, and most planner features
 - Subqueries, window functions, CTEs, views, triggers, stored routines
 - Full MySQL type/collation system (current types are a small subset)
-- Secondary indexes
-- InnoDB-class transactions and MVCC (no snapshot isolation; locking is minimal)
+- Index scans / optimizer use of secondary indexes (indexes are not used for query planning yet)
+- InnoDB-class MVCC/undo/purge and full isolation semantics (current MVCC is basic; locking is minimal)
 
 ## Run
 

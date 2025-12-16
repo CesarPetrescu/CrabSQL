@@ -3,6 +3,7 @@
 
 # Runtime / local state
 /data/
+/data_dir/
 /test_db_aggregates/
 *.log
 probe_out.txt
@@ -12,4 +13,3 @@ check.log
 .DS_Store
 .idea/
 .vscode/
-

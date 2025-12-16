@@ -11,7 +11,7 @@ As of 2025-12-16 (UTC):
 
 **It is NOT production-ready yet**, because core “real database” requirements are missing:
 - No WAL / crash-recovery guarantees / fsync policy / verified durability story.
-- No MVCC or true isolation semantics (snapshot/serializable), no deadlock detection, minimal locking.
+- No InnoDB-class MVCC/undo/purge or full isolation semantics (snapshot/serializable); no deadlock detection; minimal locking.
 - No replication, backups/restore story, upgrade/migrations, or operational tooling parity.
 - SQL dialect coverage is far from MySQL 8.0 / MariaDB latest (joins, subqueries, optimizer, collations, etc.).
 - MySQL 8.0 auth/TLS/session features are incomplete (`caching_sha2_password`, TLS, session tracking, etc.).
@@ -72,4 +72,3 @@ Copy/paste this into a new file under `status/`:
 ## Notes / Follow-ups
 - <known limitations, next steps>
 ```
-
